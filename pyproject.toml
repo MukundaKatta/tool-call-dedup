@@ -3,9 +3,9 @@ requires = ["hatchling>=1.24"]
 build-backend = "hatchling.build"
 
 [project]
-name = "token-budget-py"
+name = "tool-call-dedup"
 version = "0.1.0"
-description = "Thread-safe shared token + USD budget for concurrent LLM tasks. Raises BudgetExceeded on push past cap. Reserve/commit two-phase API for fan-out workloads. Zero runtime deps."
+description = "Session-scoped exact-duplicate tool call detection for AI agents. Same tool + same args = cached result. No TTL, no eviction, thread-safe. Zero runtime deps."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -13,12 +13,11 @@ authors = [{ name = "Mukunda Rao Katta", email = "mukunda.vjcs6@gmail.com" }]
 keywords = [
   "llm",
   "ai",
-  "budget",
-  "cost",
-  "concurrency",
-  "fan-out",
   "agents",
-  "rate-limit",
+  "dedup",
+  "cache",
+  "tool-calls",
+  "idempotency",
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -40,13 +39,12 @@ dependencies = []
 dev = ["pytest>=8.0", "ruff>=0.4"]
 
 [project.urls]
-Homepage = "https://github.com/MukundaKatta/token-budget-py"
-Issues = "https://github.com/MukundaKatta/token-budget-py/issues"
-Source = "https://github.com/MukundaKatta/token-budget-py"
-"Rust sibling" = "https://crates.io/crates/token-budget-pool"
+Homepage = "https://github.com/MukundaKatta/tool-call-dedup"
+Issues = "https://github.com/MukundaKatta/tool-call-dedup/issues"
+Source = "https://github.com/MukundaKatta/tool-call-dedup"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/token_budget"]
+packages = ["src/tool_call_dedup"]
 
 [tool.hatch.build.targets.sdist]
 include = ["/src", "/tests", "/README.md", "/LICENSE"]
