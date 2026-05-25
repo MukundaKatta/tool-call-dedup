@@ -1,254 +1,256 @@
-"""Session-scoped exact-duplicate detection for LLM tool calls.
+"""
+tool_call_dedup — session-scoped exact duplicate tool-call detection.
 
-LLM agents sometimes get stuck in loops, calling the same tool with the
-same arguments repeatedly.  :class:`ToolCallDedup` detects exact
-duplicates within a session (or globally) and lets callers decide whether
-to skip, error, or log.
-
-Keys are stable canonical hashes over ``(tool_name, sorted_kwargs)``.
-
-Example::
-
-    from tool_call_dedup import ToolCallDedup
-
-    dedup = ToolCallDedup()
-
-    # Inside your tool dispatch loop:
-    if dedup.is_duplicate("search", session="sess1", query="climate change"):
-        print("Skipping duplicate tool call")
-    else:
-        result = search(query="climate change")
-        dedup.record("search", session="sess1", query="climate change")
-
-    # Or use allow() which records on first call
-    if dedup.allow("search", session="sess1", query="climate change"):
-        result = search(query="climate change")
+Tracks (tool_name, input_hash) pairs and raises or warns when the same
+call is attempted again. Zero dependencies (stdlib: hashlib, json, dataclasses).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import time
-from typing import Any, Callable
+from dataclasses import dataclass, field
+from typing import Any
 
 
-def _make_key(tool_name: str, kwargs: dict[str, Any]) -> str:
-    """Build a stable canonical key for a tool call.
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
-    Sorts kwargs by key so that argument order does not matter.
-    Uses SHA-256 truncated to 16 hex chars for the kwargs fingerprint.
-    """
-    canonical = json.dumps(
-        {"tool": tool_name, "args": kwargs}, sort_keys=True, default=str
-    )
-    digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
-    return f"{tool_name}:{digest}"
+class DuplicateCall(Exception):
+    """Raised when a tool call is detected as a duplicate."""
 
-
-class DuplicateToolCallError(Exception):
-    """Raised by :meth:`ToolCallDedup.require_unique` on a duplicate."""
-
-    def __init__(self, tool_name: str, call_key: str) -> None:
+    def __init__(self, tool_name: str, call_count: int, input_repr: str) -> None:
         self.tool_name = tool_name
-        self.call_key = call_key
+        self.call_count = call_count
+        self.input_repr = input_repr
         super().__init__(
-            f"Duplicate tool call detected: {tool_name!r} (key={call_key!r})"
+            f"Duplicate call to {tool_name!r} (seen {call_count} time(s)): {input_repr[:80]}"
         )
 
 
-class ToolCallDedup:
-    """Session-scoped exact-duplicate detector for tool calls.
+# ---------------------------------------------------------------------------
+# Call record
+# ---------------------------------------------------------------------------
 
-    Calls are identified by a stable hash of ``(tool_name, kwargs)``.
-    Each session maintains independent call history; the default session
-    key is ``None`` (a single global bucket).
+@dataclass
+class CallRecord:
+    """Record of a single seen call."""
 
-    Args:
-        ttl:   Optional time-to-live in seconds.  Entries older than *ttl*
-               are considered expired and no longer count as duplicates.
-               Pass ``None`` (default) to keep entries forever.
-        clock: Optional callable returning current time as a float
-               (default: ``time.monotonic``).  Useful in tests.
+    tool_name: str
+    input_hash: str
+    count: int = 1
+    input_repr: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Dedup
+# ---------------------------------------------------------------------------
+
+def _hash_input(input_data: Any) -> str:
+    """Stable hash of tool input — key-order insensitive."""
+    try:
+        serialized = json.dumps(input_data, sort_keys=True, default=str)
+    except Exception:
+        serialized = str(input_data)
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _input_repr(input_data: Any) -> str:
+    try:
+        return json.dumps(input_data, sort_keys=True, default=str)[:120]
+    except Exception:
+        return str(input_data)[:120]
+
+
+class CallDedup:
+    """
+    Session-scoped exact duplicate tool-call detector.
+
+    Usage::
+
+        dedup = CallDedup()
+
+        for tool_use in response.tool_uses:
+            if dedup.is_duplicate(tool_use.name, tool_use.input):
+                continue   # skip; we already did this
+            dedup.record(tool_use.name, tool_use.input)
+            result = call_tool(tool_use)
     """
 
     def __init__(
         self,
         *,
-        ttl: float | None = None,
-        clock: Callable[[], float] | None = None,
+        raise_on_duplicate: bool = False,
+        track_per_tool: bool = True,
     ) -> None:
-        if ttl is not None and ttl <= 0:
-            raise ValueError(f"ttl must be > 0 or None, got {ttl}")
-        self._ttl = ttl
-        self._clock = clock or time.monotonic
-        # session -> {call_key -> timestamp}
-        self._history: dict[str | None, dict[str, float]] = {}
+        """
+        Args:
+            raise_on_duplicate: If True, :meth:`check_and_record` raises
+                                :class:`DuplicateCall` on a dup.
+                                If False (default), it returns False.
+            track_per_tool: If True (default), the (tool_name, input_hash)
+                            pair is tracked. If False, only input_hash is
+                            tracked (same input to different tools counts as dup).
+        """
+        self.raise_on_duplicate = raise_on_duplicate
+        self.track_per_tool = track_per_tool
+        # key → CallRecord
+        self._seen: dict[str, CallRecord] = {}
 
     # ------------------------------------------------------------------
     # Core API
     # ------------------------------------------------------------------
 
-    def is_duplicate(
-        self,
-        tool_name: str,
-        *,
-        session: str | None = None,
-        **kwargs: Any,
-    ) -> bool:
-        """Return ``True`` if this exact call was already seen in *session*.
+    def _make_key(self, tool_name: str, input_hash: str) -> str:
+        if self.track_per_tool:
+            return f"{tool_name}:{input_hash}"
+        return input_hash
 
-        Does **not** record the call.
-
-        Args:
-            tool_name: Name of the tool being called.
-            session:   Session identifier.  Defaults to ``None``.
-            **kwargs:  Tool arguments (any JSON-serialisable values).
+    def is_duplicate(self, tool_name: str, input_data: Any) -> bool:
         """
-        key = _make_key(tool_name, kwargs)
-        bucket = self._bucket(session)
-        self._prune(bucket)
-        return key in bucket
+        Return True if this (tool_name, input) has been seen before.
 
-    def allow(
-        self,
-        tool_name: str,
-        *,
-        session: str | None = None,
-        **kwargs: Any,
-    ) -> bool:
-        """Return ``True`` if this call is **not** a duplicate, and record it.
-
-        If the call is a duplicate, nothing is recorded and ``False`` is
-        returned.
+        Does NOT record the call.
 
         Args:
-            tool_name: Name of the tool being called.
-            session:   Session identifier.  Defaults to ``None``.
-            **kwargs:  Tool arguments.
+            tool_name: Tool name.
+            input_data: Tool input (dict, str, or any JSON-serializable value).
 
         Returns:
-            ``True`` on the first call with these arguments, ``False`` on
-            any subsequent duplicate.
+            bool
         """
-        key = _make_key(tool_name, kwargs)
-        bucket = self._bucket(session)
-        self._prune(bucket)
-        if key in bucket:
-            return False
-        bucket[key] = self._clock()
-        return True
+        h = _hash_input(input_data)
+        key = self._make_key(tool_name, h)
+        return key in self._seen
 
-    def record(
-        self,
-        tool_name: str,
-        *,
-        session: str | None = None,
-        **kwargs: Any,
-    ) -> None:
-        """Record a tool call **without** checking for duplicates.
+    def record(self, tool_name: str, input_data: Any) -> CallRecord:
+        """
+        Record a call (incrementing count if already seen).
 
-        Use this when the call already happened externally.
+        Does NOT check for duplicates or raise.
 
         Args:
-            tool_name: Name of the tool being called.
-            session:   Session identifier.  Defaults to ``None``.
-            **kwargs:  Tool arguments.
+            tool_name: Tool name.
+            input_data: Tool input.
+
+        Returns:
+            :class:`CallRecord`
         """
-        key = _make_key(tool_name, kwargs)
-        bucket = self._bucket(session)
-        bucket[key] = self._clock()
+        h = _hash_input(input_data)
+        key = self._make_key(tool_name, h)
+        if key in self._seen:
+            self._seen[key].count += 1
+        else:
+            self._seen[key] = CallRecord(
+                tool_name=tool_name,
+                input_hash=h,
+                count=1,
+                input_repr=_input_repr(input_data),
+            )
+        return self._seen[key]
 
-    def require_unique(
-        self,
-        tool_name: str,
-        *,
-        session: str | None = None,
-        **kwargs: Any,
-    ) -> None:
-        """Like :meth:`allow`, but raises :class:`DuplicateToolCallError`.
-
-        Records the call if it is new; raises if it is a duplicate.
+    def check_and_record(self, tool_name: str, input_data: Any) -> bool:
+        """
+        Check if this call is a duplicate, then record it.
 
         Args:
-            tool_name: Name of the tool being called.
-            session:   Session identifier.  Defaults to ``None``.
-            **kwargs:  Tool arguments.
+            tool_name: Tool name.
+            input_data: Tool input.
+
+        Returns:
+            True if this is the FIRST time this call is seen (not a dup).
+            False if it is a duplicate (and ``raise_on_duplicate`` is False).
 
         Raises:
-            DuplicateToolCallError: If the call is a duplicate.
+            :class:`DuplicateCall` if it is a dup and ``raise_on_duplicate`` is True.
         """
-        key = _make_key(tool_name, kwargs)
-        bucket = self._bucket(session)
-        self._prune(bucket)
-        if key in bucket:
-            raise DuplicateToolCallError(tool_name, key)
-        bucket[key] = self._clock()
+        h = _hash_input(input_data)
+        key = self._make_key(tool_name, h)
+        is_new = key not in self._seen
+        rec = self.record(tool_name, input_data)
+        if not is_new:
+            if self.raise_on_duplicate:
+                raise DuplicateCall(tool_name, rec.count, rec.input_repr)
+            return False
+        return True
 
     # ------------------------------------------------------------------
-    # Queries
+    # Inspection
     # ------------------------------------------------------------------
 
-    def call_count(self, session: str | None = None) -> int:
-        """Return the number of distinct tool calls recorded in *session*."""
-        bucket = self._bucket(session)
-        self._prune(bucket)
-        return len(bucket)
-
-    def key_for(self, tool_name: str, **kwargs: Any) -> str:
-        """Return the canonical dedup key for *tool_name* + *kwargs*.
-
-        Useful for inspection and testing.
+    def count(self, tool_name: str, input_data: Any) -> int:
         """
-        return _make_key(tool_name, kwargs)
-
-    def sessions(self) -> list[str | None]:
-        """Return a sorted list of all sessions that have history.
-
-        ``None`` (the default session) appears first if present.
-        """
-        keys = list(self._history.keys())
-        nones = [k for k in keys if k is None]
-        strings = sorted(k for k in keys if k is not None)
-        return nones + strings
-
-    # ------------------------------------------------------------------
-    # Management
-    # ------------------------------------------------------------------
-
-    def clear(self, session: str | None = "_ALL_") -> ToolCallDedup:
-        """Clear the call history for *session*, or all sessions.
-
-        Args:
-            session: Session to clear.  Pass ``None`` to clear the default
-                     (``None``) session.  Pass the sentinel string
-                     ``"_ALL_"`` (default) to clear everything.
+        Return how many times this call has been seen.
 
         Returns:
-            ``self`` for chaining.
+            0 if never seen, else the count.
         """
-        if session == "_ALL_":
-            self._history.clear()
-        elif session in self._history:
-            del self._history[session]
-        return self
+        h = _hash_input(input_data)
+        key = self._make_key(tool_name, h)
+        rec = self._seen.get(key)
+        return rec.count if rec else 0
+
+    def seen_calls(self, tool_name: str | None = None) -> list[CallRecord]:
+        """
+        Return all recorded calls.
+
+        Args:
+            tool_name: If given, filter to this tool only.
+
+        Returns:
+            List of :class:`CallRecord`.
+        """
+        records = list(self._seen.values())
+        if tool_name is not None:
+            records = [r for r in records if r.tool_name == tool_name]
+        return records
+
+    def unique_call_count(self, tool_name: str | None = None) -> int:
+        """Number of distinct (tool, input) pairs seen."""
+        return len(self.seen_calls(tool_name))
+
+    def total_call_count(self, tool_name: str | None = None) -> int:
+        """Total number of calls recorded (including duplicates)."""
+        return sum(r.count for r in self.seen_calls(tool_name))
+
+    def duplicate_count(self, tool_name: str | None = None) -> int:
+        """Number of duplicate calls (count - 1 for each multi-seen entry)."""
+        return sum(max(0, r.count - 1) for r in self.seen_calls(tool_name))
+
+    def summary(self) -> dict[str, Any]:
+        """Return a summary dict."""
+        return {
+            "unique_calls": self.unique_call_count(),
+            "total_calls": self.total_call_count(),
+            "duplicate_calls": self.duplicate_count(),
+            "tools_seen": list({r.tool_name for r in self._seen.values()}),
+        }
 
     # ------------------------------------------------------------------
-    # Internals
+    # Reset
     # ------------------------------------------------------------------
 
-    def _bucket(self, session: str | None) -> dict[str, float]:
-        if session not in self._history:
-            self._history[session] = {}
-        return self._history[session]
+    def reset(self, tool_name: str | None = None) -> None:
+        """
+        Clear recorded calls.
 
-    def _prune(self, bucket: dict[str, float]) -> None:
-        if self._ttl is None:
-            return
-        cutoff = self._clock() - self._ttl
-        expired = [k for k, ts in bucket.items() if ts <= cutoff]
-        for k in expired:
-            del bucket[k]
+        Args:
+            tool_name: If given, only clear calls for this tool.
+                       If None, clear all.
+        """
+        if tool_name is None:
+            self._seen.clear()
+        else:
+            to_delete = [k for k, r in self._seen.items() if r.tool_name == tool_name]
+            for k in to_delete:
+                del self._seen[k]
 
-    def __repr__(self) -> str:
-        return f"ToolCallDedup(ttl={self._ttl}, sessions={len(self._history)})"
+    def __len__(self) -> int:
+        return len(self._seen)
+
+    def __contains__(self, item: tuple[str, Any]) -> bool:
+        """Support ``(tool_name, input_data) in dedup`` syntax."""
+        if isinstance(item, tuple) and len(item) == 2:
+            return self.is_duplicate(item[0], item[1])
+        return False
