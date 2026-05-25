@@ -1,61 +1,39 @@
 [build-system]
-requires = ["hatchling>=1.24"]
+requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
 name = "tool-call-dedup"
 version = "0.1.0"
-description = "Session-scoped exact-duplicate tool call detection for AI agents. Same tool + same args = cached result. No TTL, no eviction, thread-safe. Zero runtime deps."
+description = "Session-scoped exact-duplicate detection for LLM tool calls"
 readme = "README.md"
-requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "Mukunda Rao Katta", email = "mukunda.vjcs6@gmail.com" }]
-keywords = [
-  "llm",
-  "ai",
-  "agents",
-  "dedup",
-  "cache",
-  "tool-calls",
-  "idempotency",
-]
-classifiers = [
-  "Development Status :: 3 - Alpha",
-  "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
-  "Operating System :: OS Independent",
-  "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
-  "Programming Language :: Python :: 3.14",
-  "Topic :: Software Development :: Libraries :: Python Modules",
-]
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
 dependencies = []
+keywords = ["agent", "llm", "tool", "dedup", "idempotency", "cache"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.4"]
-
-[project.urls]
-Homepage = "https://github.com/MukundaKatta/tool-call-dedup"
-Issues = "https://github.com/MukundaKatta/tool-call-dedup/issues"
-Source = "https://github.com/MukundaKatta/tool-call-dedup"
+dev = ["pytest>=7", "ruff>=0.4"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tool_call_dedup"]
 
-[tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/README.md", "/LICENSE"]
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
-
-[tool.ruff]
-target-version = "py310"
-line-length = 100
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
